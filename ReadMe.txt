@@ -2,7 +2,7 @@ Description for DNS2SOCKS
 -------------------------
 
 DNS2SOCKS is a command line utility running to forward DNS requests to a
-DNS server via a SOCKS tunnel.
+DNS server via a SOCKS or HTTP tunnel.
 
 I know that this is no new idea, but let me explain why I've coded this:
 Windows supports using a SOCKS server for Internet connections, but it
@@ -24,9 +24,10 @@ For IPv6 open the properties of "Internet Protocol Version 6
 "::1" for the "Preferred DNS server".
 
 After that run your SOCKS server (must support SOCKS protocol version 5,
-for example Tor) and start DNS2SOCKS using the correct command line
-switches (see below). Now all DNS requests of your OS (triggered by any
-application) run through DNS2SOCKS and your SOCKS server.
+for example Tor) or HTTP proxy and start DNS2SOCKS using the correct
+command line switches (see below). Now all DNS requests of your OS
+(triggered by any application) run through DNS2SOCKS and your SOCKS
+server or HTTP proxy.
 
 You can additionally configure Windows to use your SOCKS server for
 Internet connections (for the content, not DNS). To do this open the
@@ -37,13 +38,16 @@ click on "Advanced". Enter your SOCKS server address and port in the field
 web pages via your SOCKS server. This works with most browsers. However,
 you should rely on IPv4 for Tor here as (most?) Tor exit servers currently
 don't support IPv6 (see below).
+The settings are similar for using a HTTP proxy.
 
 The command line call for DNS2SOCKS has the following format:
 
-DNS2SOCKS [/?] [/d] [/q] [l[a]:FilePath] [/u:User /p:Password]
+DNS2SOCKS [/?] [/t] [/d] [/q] [l[a]:FilePath] [/u:User /p:Password]
           [Socks5ServIP[:Port]] [DNSServIPorName[:Port]] [ListenIP[:Port]]
 
 /?            or any invalid parameter outputs the usage text
+/t            to use a HTTP proxy instead of a SOCKS server
+              (here: Socks5ServIP = HttpProxyIP, no support for /u and /p)
 /d            disables the cache
 /q            disables the text output to the console
 /l:FilePath   creates a new log file "FilePath"
@@ -98,7 +102,7 @@ better to specify the DNS server name as the exit server can choose IPv4
 or IPv6 automatically this way. Directly specifying an IPv4 address might
 be a bit faster; currently all Tor exit servers should support this.
 
-As DNS requests running through the SOCKS tunnel are very slow, the
+As DNS requests running through the SOCKS/HTTP tunnel are very slow, the
 calling application might time out before it gets the answer - in this
 case just try it again (press "reload" in the browser).
 
@@ -177,7 +181,25 @@ SUCH DAMAGE.
 
 
 
-Changes of Version 1.8 (released on 2015-01-01)
+Changes of version 2.0 (released on 2015-06-28)
+-----------------------------------------------
+
+- Added command line parameter /t to use a HTTP proxy instead of a SOCKS5
+  server (HTTP CONNECT tunneling)
+- SHA256 for DNS2SOCKS.exe:
+  ba841370b0d79b776438eb22a9131e91250025b55db4200db8f66a060cf6047d
+
+
+Changes of version 1.9 (released on 2015-06-18)
+-----------------------------------------------
+
+- Added fallback to old IPv4 parsing via "inet_addr" in case "getaddrinfo"
+  fails (workaround for erroneous "getaddrinfo" implementation)
+- SHA256 for DNS2SOCKS.exe:
+  5612bf263136852c39d929691b63a103c166f78bbd606d7947ce1d813c28c560
+
+
+Changes of version 1.8 (released on 2015-01-01)
 -----------------------------------------------
 
 - Support for IPv6
@@ -188,7 +210,7 @@ Changes of Version 1.8 (released on 2015-01-01)
   d654659b031ede16224fa37f585c735112a689f46497afc3fca6ccd4cde70b93
 
 
-Changes of Version 1.7 (released on 2013-11-14)
+Changes of version 1.7 (released on 2013-11-14)
 -----------------------------------------------
 
 - Support for SOCKS5 user/password authentication (method 0x02)
@@ -196,7 +218,7 @@ Changes of Version 1.7 (released on 2013-11-14)
   63c0fd8f9dcd3f3546691892999d868ce74601778111dcf08cdfeb140818d28e
 
 
-Changes of Version 1.6 (released on 2013-10-21)
+Changes of version 1.6 (released on 2013-10-21)
 -----------------------------------------------
 
 - Cache function respects the "time to live" field of DNS answers
@@ -205,7 +227,7 @@ Changes of Version 1.6 (released on 2013-10-21)
   45a20efacb8fed901299712ae2ee6147ac453d69c349b0766024cb5d3634a0b5
 
 
-Changes of Version 1.5 (released on 2013-10-06)
+Changes of version 1.5 (released on 2013-10-06)
 -----------------------------------------------
 
 - Removed several compiler warnings that appeared when compiling for
@@ -217,7 +239,7 @@ Changes of Version 1.5 (released on 2013-10-06)
   8e987da2a57e5be942c21c76e28e185279a527ed67a468dab5757d38dc1e37ea
 
 
-Changes of Version 1.4 (released on 2013-01-19)
+Changes of version 1.4 (released on 2013-01-19)
 -----------------------------------------------
 
 - Command line parameter /l:filePath or /la:filePath to create a log file
@@ -227,7 +249,7 @@ Changes of Version 1.4 (released on 2013-01-19)
   cae8aab900897b2c03bd8f3d415de91df596479bca2f83b107455ba68de28793
 
 
-Changes of Version 1.3 (released on 2012-11-03)
+Changes of version 1.3 (released on 2012-11-03)
 -----------------------------------------------
 
 - DNS requests/responses via TCP additionally to UDP (still always via
@@ -252,20 +274,9 @@ Changes of Version 1.3 (released on 2012-11-03)
 - SHA1 for DNS2SOCKS.exe: 596015cba187a9184c5b480b8666c0d4b37d9552
 
 
-Changes of Version 1.2 (released on 2012-01-13)
+Changes of version 1.2 (released on 2012-01-13)
 -----------------------------------------------
 
 You can configure the listen address via the command line now. The default
 is 127.0.0.1 instead of 0.0.0.0 of version 1.1. This way the Windows
 firewall doesn't show up.
-
-# Linux Build
-
-cd $source-dir-root
-
-mkdir build 
-
-cd build ; cmake .. ; make
-
-make install 
-
