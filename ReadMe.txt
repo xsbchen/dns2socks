@@ -50,6 +50,7 @@ DNS2SOCKS [/?] [/t] [/d] [/q] [l[a]:FilePath] [/u:User /p:Password]
               (here: Socks5ServIP = HttpProxyIP, no support for /u and /p)
 /d            disables the cache
 /q            disables the text output to the console
+/w	    sets the ip address wpad resolves to
 /l:FilePath   creates a new log file "FilePath"
 /la:FilePath  creates a new log file "FilePath" or appends to the file if
               it already exists
