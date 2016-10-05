@@ -1428,7 +1428,7 @@ int main(int iArgCount, char** szaArgs)
 			"              (here: Socks5ServerIP = HttpProxyIP, no support for /u and /p)\n"
 			"/d            to disable the cache\n"
 			"/q            to suppress the text output\n"
-			"/w		       set the ip address wpad resolves to\n"
+			"/w		       sets the ip address wpad resolves to\n"
 			"/l:FilePath   to create a new log file \"FilePath\"\n"
 			"/la:FilePath  to create a new log file or append to the existing \"FilePath\"\n"
 			"/u:User       user name if your SOCKS server uses user/password authentication\n"
