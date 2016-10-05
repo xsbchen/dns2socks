@@ -15,13 +15,16 @@
 //127.0.0.1 for default SOCKS5 server
 #define DEFAULT_SOCKS_SERVER "127.0.0.1"
 //9050 for default SOCKS5 port
-#define DEFAULT_SOCKS_PORT "9050"
+#define DEFAULT_SOCKS_PORT "1080"
 //213.73.91.35 for default DNS server supporting TCP (dnscache.berlin.ccc.de)
-#define DEFAULT_DNS_SERVER "213.73.91.35"
+#define DEFAULT_DNS_SERVER "8.8.8.8"
 //127.0.0.1 for local IP address for listening
 #define DEFAULT_LISTEN_IP "127.0.0.1"
 //53 for default DNS port
 #define DEFAULT_DNS_PORT "53"
+
+#define DEFAULT_WPAD_IP "127.0.0.1"
+
 
 //defines for OutputToLog (bits)
 #define OUTPUT_LINE_BREAK (1)
@@ -57,6 +60,8 @@ static unsigned char* g_uaUsrPwd=NULL;			//authentication package for SOCKS
 static int g_iUsrPwdLen;						//length of g_caUsrPwd
 static int g_iHttpProxyConnectLen=0;			//length of CONNECT command in g_caHttpProxyConnect
 static char g_caHttpProxyConnect[300];			//CONNECT command in case of using HTTP proxy
+static int g_useWpad;
+static char g_wpadAddress[4];
 
 //OS specific functionality
 #ifdef _WIN32
@@ -866,10 +871,89 @@ THREAD_FUNCTION(DnsThread, pEntry)
 	return 0;
 }
 
+static int HandleWpad(uint16_t* u16aRequest, int iLen, void* pClientAddr, socklen_t iAddrLen)
+{
+	uint8_t* pu8Pos;
+	uint8_t* pu8End;
+	unsigned char uLen;
+	struct SEntry sEntry;
+
+	int ret = 0;
+
+	pu8Pos = (uint8_t*)u16aRequest + 12;
+	pu8End = (uint8_t*)u16aRequest + iLen;
+	while (pu8Pos < pu8End)
+	{
+		uLen = *pu8Pos;
+		if (!uLen)
+		{
+			if (stricmp((char*)((uint8_t*)u16aRequest + 13), "wpad") == 0)
+			{
+				OutputToLog(OUTPUT_ALL, "wpad" );
+
+				memset(&sEntry, 0, sizeof(sEntry));
+				
+				sEntry.iTime = (time_t)-1;
+				sEntry.u16aAnswer = NULL;
+				sEntry.uAddrLen = (unsigned char)iAddrLen;
+				memcpy(&sEntry.client, pClientAddr, iAddrLen);
+				
+				const char* req = (const char*)u16aRequest;
+
+				const char response[] = 
+				{
+					// header
+					req[0], req[1], //id
+					-127, -128,
+					0, 1, // q_count
+					0, 1, // ans_count
+					0, 0, // auth_count
+					0, 0, // add_count
+
+					// question 1
+					4, 'w', 'p', 'a', 'd', 0, // name
+					0, 1, // 'A'
+					0, 1, // 'IN'
+
+					// answer 1
+					-64, 12, // name ref @ offset 12
+					0, 1, // 'A'
+					0, 1, // 'IN'
+					0, 0, 0, 76, // TTL
+					0, 4, // data len
+					g_wpadAddress[0], g_wpadAddress[1], g_wpadAddress[2], g_wpadAddress[3] // ip
+				};
+
+				char fullResponse[sizeof(response) + 2] = { 0 };
+
+				*((uint16_t*)fullResponse) = htons(sizeof(response));
+				memcpy(fullResponse + 2, response, sizeof(response)); // length
+
+				sEntry.u16aAnswer = (uint16_t*)fullResponse;
+				
+				SendAnswer(&sEntry);
+
+				ret = 1;
+			}
+			break;
+		}
+		if (uLen >= 0xc0)	//compression used? (reference to other name via offset)
+			break;		//no output in this case
+		pu8Pos += uLen + 1;
+	}
+
+	return ret;
+}
+
 //searches the cache for the same request and sends the answer if there is a cache hit
 //or creates a thread for forwarding the request to the DNS server via SOCKS
 static void HandleDnsRequest(uint16_t* u16aRequest, int iLen, void* pClientAddr, socklen_t iAddrLen)
 {
+	if (g_useWpad && HandleWpad(u16aRequest, iLen, pClientAddr, iAddrLen))
+	{
+		return;
+	}
+
 	uint8_t* pu8Pos;
 	uint8_t* pu8End;
 	struct SEntry* psEntry;
@@ -1225,6 +1309,9 @@ int main(int iArgCount, char** szaArgs)
 		{ &sAddr, DEFAULT_LISTEN_IP, DEFAULT_DNS_PORT, "listening", AI_PASSIVE }	//AI_PASSIVE for "getaddrinfo" as we use it for "bind"
 	};
 	
+	const char* wpadAddress;
+
+
 	//parse command line - use e.g. "/?" to display the usage
 	bQuiet=0;
 	bAppend=0;
@@ -1232,6 +1319,8 @@ int main(int iArgCount, char** szaArgs)
 	szLogFilePath=NULL;
 	szUser=NULL;
 	szPassword=NULL;
+	wpadAddress = NULL;
+
 	for(pszCurArg=szaArgs+1; --iArgCount; ++pszCurArg)
 	{
 		szCurArg=*pszCurArg;
@@ -1288,6 +1377,33 @@ int main(int iArgCount, char** szaArgs)
 			case 'T':
 				g_iHttpProxyConnectLen=1;	//used as boolean here; later it contains the real length of the CONNECT command
 				continue;
+			case 'w':
+			case 'W':
+				if (!wpadAddress && szCurArg[2] == ':')
+				{
+					wpadAddress = szCurArg + 3;
+
+					const char* p = wpadAddress;
+					int pos = 0;
+					while (pos < 4)
+					{
+						g_wpadAddress[pos++] = (char)atoi(p);
+
+						while (*p && *p != '.')
+							p++;
+						p++;
+
+						if (*p == 0)
+							break;
+					}
+
+					if (pos == 4)
+					{
+						g_useWpad = 1;
+						continue;
+					}
+				}
+				break;
 			}
 		}
 		else
@@ -1312,6 +1428,7 @@ int main(int iArgCount, char** szaArgs)
 			"              (here: Socks5ServerIP = HttpProxyIP, no support for /u and /p)\n"
 			"/d            to disable the cache\n"
 			"/q            to suppress the text output\n"
+			"/w		       set the ip address wpad resolves to\n"
 			"/l:FilePath   to create a new log file \"FilePath\"\n"
 			"/la:FilePath  to create a new log file or append to the existing \"FilePath\"\n"
 			"/u:User       user name if your SOCKS server uses user/password authentication\n"
@@ -1425,12 +1542,14 @@ int main(int iArgCount, char** szaArgs)
 		"DNS server   %s port %s\n"
 		"listening on %s port %s\n"
 		"cache %s\n"
-		"authentication %s\n",
+		"authentication %s\n"
+		"wpad %s\n",
 		g_iHttpProxyConnectLen?"HTTP proxy  ":"SOCKS server", (char*)u16aBuf, (char*)u16aBuf+256,
 		(char*)u16aBuf+512, (char*)u16aBuf+768,
 		(char*)u16aBuf+1024, (char*)u16aBuf+1280,
 		g_bCacheEnabled?"enabled":"disabled",
-		szUser?"enabled":"disabled");
+		szUser?"enabled":"disabled", 
+		wpadAddress ? wpadAddress : "[none]");
 
 	InitializeCriticalSection(&g_sCritSect);
 
@@ -1449,7 +1568,7 @@ int main(int iArgCount, char** szaArgs)
 		g_uaUsrPwd[uUserLen+2]=(unsigned char)uPasswordLen;
 		memcpy(g_uaUsrPwd+uUserLen+3, szPassword, uPasswordLen);
 	}
-
+	
 	//create thread for TCP connection
 	ThreadCreate(TcpThread, &sAddr);
 
