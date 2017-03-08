@@ -349,6 +349,11 @@ int ThreadCreate(void* (*pThreadFunction)(void*), void* pParam)
 	return 1;	//o.k.
 }
 
+static int stricmp(const char *s1, const char *s2)
+{
+	return strcasecmp(s1, s2);
+}
+
 #endif //#ifdef _WIN32
 
 
