@@ -43,25 +43,32 @@ struct SEntry
 {
 	struct SEntry* psNext;			//next list entry or NULL
 	uint16_t* u16aAnswer;			//pointer to answer or NULL
+	int isAltDomain;
 	time_t iTime;					//time when the answer was deliviered last time
 	union UClient client;			//information on how to send response back to client
 	unsigned char uAddrLen;			//length of used part of sAddr for UDP, sizeof(SOCKET) for TCP
 	uint16_t u16aRequest[1];		//extended dynamically at malloc for "struct SEntry" (use "uint16_t" to ensure according alignment, first element contains length in big endian format)
 };
 
-static struct SEntry* g_psFirst=NULL;			//list of DNS requests and answers (cache)
-static unsigned int g_uCacheCount=0;			//amout of entries in list g_psFirst
-static int g_bCacheEnabled=1;					//!=0 when cache is enabled
-static struct sockaddr_storage g_sDnsSrvAddr;	//DNS server supporting TCP
-static struct sockaddr_storage g_sSocksAddr;	//SOCKS5 server
+static struct SEntry* g_psFirst = NULL;			//list of DNS requests and answers (cache)
+static unsigned int g_uCacheCount = 0;			//amount of entries in list g_psFirst
+static int g_bCacheEnabled = 1;					//!=0 when cache is enabled
+static struct sockaddr_storage g_dnsSrvAddr;	//DNS server supporting TCP
+static struct sockaddr_storage g_proxyAddr;		//SOCKS5 server
+static struct sockaddr_storage g_altProxyAddr;	//SOCKS5 server (for alt domains)
+static struct sockaddr_storage g_wpadAddr;		//wpad addr
 static CRITICAL_SECTION g_sCritSect;			//to protect the list g_psFirst and g_uCacheCount
 static SOCKET g_hSockUdp;						//UDP socket
-static unsigned char* g_uaUsrPwd=NULL;			//authentication package for SOCKS
+static unsigned char* g_uaUsrPwd = NULL;		//authentication package for SOCKS
 static int g_iUsrPwdLen;						//length of g_caUsrPwd
-static int g_iHttpProxyConnectLen=0;			//length of CONNECT command in g_caHttpProxyConnect
+static int g_iHttpProxyConnectLen = 0;			//length of CONNECT command in g_caHttpProxyConnect
 static char g_caHttpProxyConnect[300];			//CONNECT command in case of using HTTP proxy
-static int g_useWpad;
-static char g_wpadAddress[4];
+
+static int g_useWpad = 0;
+static int g_useAltProxyServer = 0;
+
+static char* g_altDomainFilters[65535];
+static int g_altDomainFilterCount = 0;
 
 //OS specific functionality
 #ifdef _WIN32
@@ -349,11 +356,6 @@ int ThreadCreate(void* (*pThreadFunction)(void*), void* pParam)
 	return 1;	//o.k.
 }
 
-static int stricmp(const char *s1, const char *s2)
-{
-	return strcasecmp(s1, s2);
-}
-
 #endif //#ifdef _WIN32
 
 
@@ -515,28 +517,28 @@ static int CalculateTimeToLive(struct SEntry* psEntry)
 //receives a specific amount of bytes
 static int ReceiveBytes(SOCKET hSock, unsigned int uAmount, uint16_t* u16aBuf)
 {
-	unsigned int uPos=0;
+	unsigned int uPos = 0;
 	int iLen;
 	char* szErrMsg;
 
-	for(;;)
+	for (;;)
 	{
-		iLen=recv(hSock, (char*)u16aBuf+uPos, uAmount, 0);
-		switch(iLen)
+		iLen = recv(hSock, (char*)u16aBuf + uPos, uAmount, 0);
+		switch (iLen)
 		{
-		case SOCKET_ERROR:
-			szErrMsg=GetSysError(WSAGetLastError());
-			OutputToLog(OUTPUT_ALL, "Receiving from SOCKS server has failed: %s", szErrMsg);
-			FreeSysError(szErrMsg);
-			return 0;	//failed
-		case 0:
-			OutputToLog(OUTPUT_ALL, "The SOCKS server has closed the connection unexpectedly");
-			return 0;	//failed
-		default:
-			uAmount-=iLen;
-			if(!uAmount)
-				return 1;	//succeeded
-			uPos+=iLen;
+			case SOCKET_ERROR:
+				szErrMsg = GetSysError(WSAGetLastError());
+				OutputToLog(OUTPUT_ALL, "Receiving from SOCKS server has failed: %s", szErrMsg);
+				FreeSysError(szErrMsg);
+				return 0;	//failed
+			case 0:
+				OutputToLog(OUTPUT_ALL, "The SOCKS server has closed the connection unexpectedly");
+				return 0;	//failed
+			default:
+				uAmount -= iLen;
+				if (!uAmount)
+					return 1;	//succeeded
+				uPos += iLen;
 		}
 	}
 }
@@ -550,55 +552,55 @@ static int HandleHttpProxy(SOCKET hSock, char* caBuf)
 	int iRet;
 	int iPos;
 
-	iRet=send(hSock, g_caHttpProxyConnect, g_iHttpProxyConnectLen, 0);
-	if(iRet!=g_iHttpProxyConnectLen)
+	iRet = send(hSock, g_caHttpProxyConnect, g_iHttpProxyConnectLen, 0);
+	if (iRet != g_iHttpProxyConnectLen)
 	{
-		szErrMsg=(iRet==SOCKET_ERROR)?GetSysError(WSAGetLastError()):"Invalid amount of sent bytes";
+		szErrMsg = (iRet == SOCKET_ERROR) ? GetSysError(WSAGetLastError()) : "Invalid amount of sent bytes";
 		OutputToLog(OUTPUT_ALL, "Sending to HTTP proxy has failed: %s", szErrMsg);
-		if(iRet==SOCKET_ERROR)
+		if (iRet == SOCKET_ERROR)
 			FreeSysError(szErrMsg);
 		return 0;	//error
 	}
 	//receive answer
-	iPos=0;
-	for(;;)
+	iPos = 0;
+	for (;;)
 	{
-		iRet=recv(hSock, caBuf+iPos, 2000-iPos, 0);
-		if(iRet<=0)
+		iRet = recv(hSock, caBuf + iPos, 2000 - iPos, 0);
+		if (iRet <= 0)
 		{
-			if(iRet==SOCKET_ERROR)
+			if (iRet == SOCKET_ERROR)
 				OutputToLog(OUTPUT_ALL, "The HTTP proxy has closed the connection unexpectedly");
 			else
 			{
-				szErrMsg=GetSysError(WSAGetLastError());
+				szErrMsg = GetSysError(WSAGetLastError());
 				OutputToLog(OUTPUT_ALL, "Receiving from HTTP proxy has failed: %s", szErrMsg);
 				FreeSysError(szErrMsg);
 			}
 			return 0;	//error
 		}
-		iPos+=iRet;
-		if(iPos<4)
+		iPos += iRet;
+		if (iPos < 4)
 			continue;	//continue receiving
 		//check header, must begin with HTTP
-		if(caBuf[0]=='H' || caBuf[1]=='T' || caBuf[2]=='T' || caBuf[3]=='P')
+		if (caBuf[0] == 'H' || caBuf[1] == 'T' || caBuf[2] == 'T' || caBuf[3] == 'P')
 		{
-			caBuf[iPos]='\0';	//terminate the string
+			caBuf[iPos] = '\0';	//terminate the string
 			//try to find empty line that marks the end of the HTTP proxy answer
-			szPosEnd=strstr(caBuf, "\r\n\r\n");
-			if(!szPosEnd)
+			szPosEnd = strstr(caBuf, "\r\n\r\n");
+			if (!szPosEnd)
 				continue;	//continue receiving
 			//extract status code -> scan for space character (also stops on any control character)
-			szPosStatus=caBuf+4;
-			while(*(unsigned char*)szPosStatus>' ')
+			szPosStatus = caBuf + 4;
+			while (*(unsigned char*)szPosStatus > ' ')
 				++szPosStatus;
-			if(*szPosStatus==' ')
+			if (*szPosStatus == ' ')
 			{
 				//we want: 200 Connection established
-				if(atoi(++szPosStatus)==200)
+				if (atoi(++szPosStatus) == 200)
 					break;	//header reception complete
 				//find end of line (must be there, otherwise upper search for empty line would have failed
-				szPosEnd=strchr(szPosStatus, '\r');
-				*szPosEnd='\0';
+				szPosEnd = strchr(szPosStatus, '\r');
+				*szPosEnd = '\0';
 				OutputToLog(OUTPUT_ALL, "Connecting DNS server has failed: %s", szPosStatus);
 				return 0;	//error
 			}
@@ -607,7 +609,7 @@ static int HandleHttpProxy(SOCKET hSock, char* caBuf)
 		return 0;	//error
 	}
 	//so far there shouldn't be an answer from the DNS server (nothing after \r\n\r\n)
-	if(szPosEnd[4])
+	if (szPosEnd[4])
 	{
 		OutputToLog(OUTPUT_ALL, "DNS server answered before request");
 		return 0;	//error
@@ -619,34 +621,38 @@ static int HandleHttpProxy(SOCKET hSock, char* caBuf)
 THREAD_FUNCTION(DnsThread, pEntry)
 {
 	uint16_t u16aBuf[32754];	//max UDP packet length on Windows plus one byte - using uint16_t here for alignment
-	struct SEntry* psEntry=(struct SEntry*)pEntry;
+	struct SEntry* psEntry = (struct SEntry*)pEntry;
+	struct sockaddr_storage* selectedProxy = psEntry->isAltDomain ? &g_altProxyAddr : &g_proxyAddr;
+
 	char* szErrMsg;
-	SOCKET hSock=socket(g_sSocksAddr.ss_family, SOCK_STREAM, IPPROTO_TCP);
+	SOCKET hSock = socket(selectedProxy->ss_family, SOCK_STREAM, IPPROTO_TCP);
 	int iRet;
 	int iPos;
 	int iLen;
 
-	if(hSock==SOCKET_ERROR)
+	if (hSock == SOCKET_ERROR)
 	{
-		szErrMsg=GetSysError(WSAGetLastError());
+		szErrMsg = GetSysError(WSAGetLastError());
 		OutputToLog(OUTPUT_ALL, "Creating a TCP socket has failed: %s", szErrMsg);
 		FreeSysError(szErrMsg);
 		RemoveEntry(psEntry, hSock, g_bCacheEnabled);
 		return 0;
 	}
+
 	//connect SOCKS server or HTTP proxy
-	if(connect(hSock, (struct sockaddr*)&g_sSocksAddr, GetAddrLen(&g_sSocksAddr))==SOCKET_ERROR)
+	if (connect(hSock, (struct sockaddr*)selectedProxy, GetAddrLen(selectedProxy)) == SOCKET_ERROR)
 	{
-		szErrMsg=GetSysError(WSAGetLastError());
+		szErrMsg = GetSysError(WSAGetLastError());
 		OutputToLog(OUTPUT_ALL, "Connecting the SOCKS server has failed: %s", szErrMsg);
 		FreeSysError(szErrMsg);
 		RemoveEntry(psEntry, hSock, g_bCacheEnabled);
 		return 0;
 	}
+
 	//using HTTP proxy instead of SOCKS?
-	if(g_iHttpProxyConnectLen)
+	if (g_iHttpProxyConnectLen)
 	{
-		if(!HandleHttpProxy(hSock, (char*)u16aBuf))
+		if (!HandleHttpProxy(hSock, (char*)u16aBuf))
 		{
 			RemoveEntry(psEntry, hSock, g_bCacheEnabled);
 			return 0;
@@ -654,30 +660,30 @@ THREAD_FUNCTION(DnsThread, pEntry)
 	}
 	else
 	{
-		((uint8_t*)u16aBuf)[0]=5;	//version 5 as we use SOCKS5
-		((uint8_t*)u16aBuf)[1]=1;	//number of authentication methods supported
-		((uint8_t*)u16aBuf)[2]=g_uaUsrPwd?2:0;	//user/password authentication or no authentication
-		iLen=send(hSock, (const char*)u16aBuf, 3, 0);
-		if(iLen!=3)
+		((uint8_t*)u16aBuf)[0] = 5;	//version 5 as we use SOCKS5
+		((uint8_t*)u16aBuf)[1] = 1;	//number of authentication methods supported
+		((uint8_t*)u16aBuf)[2] = g_uaUsrPwd ? 2 : 0;	//user/password authentication or no authentication
+		iLen = send(hSock, (const char*)u16aBuf, 3, 0);
+		if (iLen != 3)
 		{
-			szErrMsg=(iLen==SOCKET_ERROR)?GetSysError(WSAGetLastError()):"Invalid amount of sent bytes";
+			szErrMsg = (iLen == SOCKET_ERROR) ? GetSysError(WSAGetLastError()) : "Invalid amount of sent bytes";
 			OutputToLog(OUTPUT_ALL, "Sending to SOCKS server has failed: %s", szErrMsg);
-			if(iLen==SOCKET_ERROR)
+			if (iLen == SOCKET_ERROR)
 				FreeSysError(szErrMsg);
 			RemoveEntry(psEntry, hSock, g_bCacheEnabled);
 			return 0;
 		}
 		//check respons
-		if(!ReceiveBytes(hSock, 2, u16aBuf+8))
+		if (!ReceiveBytes(hSock, 2, u16aBuf + 8))
 		{
 			RemoveEntry(psEntry, hSock, g_bCacheEnabled);
 			return 0;
 		}
-		if(((uint8_t*)u16aBuf)[16]!=5 || ((uint8_t*)u16aBuf)[17]!=((uint8_t*)u16aBuf)[2])
+		if (((uint8_t*)u16aBuf)[16] != 5 || ((uint8_t*)u16aBuf)[17] != ((uint8_t*)u16aBuf)[2])
 		{
-			if(((uint8_t*)u16aBuf)[16]!=5)
+			if (((uint8_t*)u16aBuf)[16] != 5)
 				OutputToLog(OUTPUT_ALL, "The SOCKS server has answered with a SOCKS version number unequal to 5");
-			else if(g_uaUsrPwd)
+			else if (g_uaUsrPwd)
 				OutputToLog(OUTPUT_ALL, "The SOCKS server does not support user/password authentication");
 			else
 				OutputToLog(OUTPUT_ALL, "The SOCKS server wants an authentication");
@@ -685,25 +691,25 @@ THREAD_FUNCTION(DnsThread, pEntry)
 			return 0;
 		}
 		//send authentication if enabled
-		if(g_uaUsrPwd)
+		if (g_uaUsrPwd)
 		{
-			iLen=send(hSock, (const char*)g_uaUsrPwd, g_iUsrPwdLen, 0);
-			if(iLen!=g_iUsrPwdLen)
+			iLen = send(hSock, (const char*)g_uaUsrPwd, g_iUsrPwdLen, 0);
+			if (iLen != g_iUsrPwdLen)
 			{
-				szErrMsg=(iLen==SOCKET_ERROR)?GetSysError(WSAGetLastError()):"Invalid amount of sent bytes";
+				szErrMsg = (iLen == SOCKET_ERROR) ? GetSysError(WSAGetLastError()) : "Invalid amount of sent bytes";
 				OutputToLog(OUTPUT_ALL, "Sending to SOCKS server has failed: %s", szErrMsg);
-				if(iLen==SOCKET_ERROR)
+				if (iLen == SOCKET_ERROR)
 					FreeSysError(szErrMsg);
 				RemoveEntry(psEntry, hSock, g_bCacheEnabled);
 				return 0;
 			}
 			//check response
-			if(!ReceiveBytes(hSock, 2, u16aBuf+8))
+			if (!ReceiveBytes(hSock, 2, u16aBuf + 8))
 			{
 				RemoveEntry(psEntry, hSock, g_bCacheEnabled);
 				return 0;
 			}
-			if(((uint8_t*)u16aBuf)[17])	//2nd byte of answer must be 0 for "success"
+			if (((uint8_t*)u16aBuf)[17])	//2nd byte of answer must be 0 for "success"
 			{
 				OutputToLog(OUTPUT_ALL, "The SOCKS server authentication has failed (error code %u)", (unsigned int)((uint8_t*)u16aBuf)[17]);
 				RemoveEntry(psEntry, hSock, g_bCacheEnabled);
@@ -711,73 +717,73 @@ THREAD_FUNCTION(DnsThread, pEntry)
 			}
 		}
 		//connect DNS server via SOCKS, the DNS server must support TCP
-		((uint8_t*)u16aBuf)[1]=1;	//establish a TCP/IP stream connection
-		((uint8_t*)u16aBuf)[2]=0;	//reserved, must be 0x00
-		switch(g_sDnsSrvAddr.ss_family)
+		((uint8_t*)u16aBuf)[1] = 1;	//establish a TCP/IP stream connection
+		((uint8_t*)u16aBuf)[2] = 0;	//reserved, must be 0x00
+		switch (g_dnsSrvAddr.ss_family)
 		{
-		case AF_UNSPEC:	//use name
-			((uint8_t*)u16aBuf)[3]=3;	//name
-			iLen=(int)((struct sockaddr_in6*)&g_sDnsSrvAddr)->sin6_flowinfo;	//length in sin6_flowinfo (see ParseIpAndPort)
-			((uint8_t*)u16aBuf)[4]=(uint8_t)iLen;	//maximum length is 255
-			memcpy(((uint8_t*)u16aBuf)+5, *(char**)&((struct sockaddr_in6*)&g_sDnsSrvAddr)->sin6_addr, iLen);	//copy name (see ParseIpAndPort)
-			*(uint16_t*)(((uint8_t*)u16aBuf)+iLen+5)=((struct sockaddr_in6*)&g_sDnsSrvAddr)->sin6_port;	//port
-			iPos=iLen+7;
-			break;
-		case AF_INET:	//use IPv4
-			((uint8_t*)u16aBuf)[3]=1;	//IPv4 address
-			*(uint32_t*)(u16aBuf+2)=((struct sockaddr_in*)&g_sDnsSrvAddr)->sin_addr.s_addr;	//address
-			*(uint16_t*)(u16aBuf+4)=((struct sockaddr_in*)&g_sDnsSrvAddr)->sin_port;		//port
-			iPos=10;
-			break;
-		default:	//use IPv6
-			((uint8_t*)u16aBuf)[3]=4;	//IPv6 address
-			memcpy(u16aBuf+2, &((struct sockaddr_in6*)&g_sDnsSrvAddr)->sin6_addr, 16);		//address
-			*(uint16_t*)(u16aBuf+10)=((struct sockaddr_in6*)&g_sDnsSrvAddr)->sin6_port;		//port
-			iPos=22;
+			case AF_UNSPEC:	//use name
+				((uint8_t*)u16aBuf)[3] = 3;	//name
+				iLen = (int)((struct sockaddr_in6*)&g_dnsSrvAddr)->sin6_flowinfo;	//length in sin6_flowinfo (see ParseIpAndPort)
+				((uint8_t*)u16aBuf)[4] = (uint8_t)iLen;	//maximum length is 255
+				memcpy(((uint8_t*)u16aBuf) + 5, *(char**)&((struct sockaddr_in6*)&g_dnsSrvAddr)->sin6_addr, iLen);	//copy name (see ParseIpAndPort)
+				*(uint16_t*)(((uint8_t*)u16aBuf) + iLen + 5) = ((struct sockaddr_in6*)&g_dnsSrvAddr)->sin6_port;	//port
+				iPos = iLen + 7;
+				break;
+			case AF_INET:	//use IPv4
+				((uint8_t*)u16aBuf)[3] = 1;	//IPv4 address
+				*(uint32_t*)(u16aBuf + 2) = ((struct sockaddr_in*)&g_dnsSrvAddr)->sin_addr.s_addr;	//address
+				*(uint16_t*)(u16aBuf + 4) = ((struct sockaddr_in*)&g_dnsSrvAddr)->sin_port;		//port
+				iPos = 10;
+				break;
+			default:	//use IPv6
+				((uint8_t*)u16aBuf)[3] = 4;	//IPv6 address
+				memcpy(u16aBuf + 2, &((struct sockaddr_in6*)&g_dnsSrvAddr)->sin6_addr, 16);		//address
+				*(uint16_t*)(u16aBuf + 10) = ((struct sockaddr_in6*)&g_dnsSrvAddr)->sin6_port;		//port
+				iPos = 22;
 		}
-		iLen=send(hSock, (const char*)u16aBuf, iPos, 0);
-		if(iLen!=iPos)
+		iLen = send(hSock, (const char*)u16aBuf, iPos, 0);
+		if (iLen != iPos)
 		{
-			szErrMsg=(iLen==SOCKET_ERROR)?GetSysError(WSAGetLastError()):"Invalid amount of sent bytes";
+			szErrMsg = (iLen == SOCKET_ERROR) ? GetSysError(WSAGetLastError()) : "Invalid amount of sent bytes";
 			OutputToLog(OUTPUT_ALL, "Connecting through SOCKS server has failed: %s", szErrMsg);
-			if(iLen==SOCKET_ERROR)
+			if (iLen == SOCKET_ERROR)
 				FreeSysError(szErrMsg);
 			RemoveEntry(psEntry, hSock, g_bCacheEnabled);
 			return 0;
 		}
 		//check expected answer (get first 5 bytes to detect address type)
-		if(!ReceiveBytes(hSock, 5, u16aBuf))
+		if (!ReceiveBytes(hSock, 5, u16aBuf))
 		{
 			RemoveEntry(psEntry, hSock, g_bCacheEnabled);
 			return 0;
 		}
-		if(((uint8_t*)u16aBuf)[0]!=5 || ((uint8_t*)u16aBuf)[1]!=0 || (((uint8_t*)u16aBuf)[3]!=1 && ((uint8_t*)u16aBuf)[3]!=3 && ((uint8_t*)u16aBuf)[3]!=4))
+		if (((uint8_t*)u16aBuf)[0] != 5 || ((uint8_t*)u16aBuf)[1] != 0 || (((uint8_t*)u16aBuf)[3] != 1 && ((uint8_t*)u16aBuf)[3] != 3 && ((uint8_t*)u16aBuf)[3] != 4))
 		{
-			szErrMsg="Unexpected answer from SOCKS server";
+			szErrMsg = "Unexpected answer from SOCKS server";
 			//correct version -> try to resolve the error code
-			if(((uint8_t*)u16aBuf)[0]==5)
-				switch(((uint8_t*)u16aBuf)[1])
+			if (((uint8_t*)u16aBuf)[0] == 5)
+				switch (((uint8_t*)u16aBuf)[1])
 				{
-				case 2:
-					szErrMsg="Connection not allowed by ruleset";
-					break;
-				case 3:
-					szErrMsg="Network unreachable";
-					break;
-				case 4:
-					szErrMsg="Host unreachable";
-					break;
-				case 5:
-					szErrMsg="Connection refused by destination host";
-					break;
-				case 6:
-					szErrMsg="TTL expired";
-					break;
-				case 7:
-					szErrMsg="Command not supported / protocol error";
-					break;
-				case 8:
-					szErrMsg="Address type not supported";
+					case 2:
+						szErrMsg = "Connection not allowed by ruleset";
+						break;
+					case 3:
+						szErrMsg = "Network unreachable";
+						break;
+					case 4:
+						szErrMsg = "Host unreachable";
+						break;
+					case 5:
+						szErrMsg = "Connection refused by destination host";
+						break;
+					case 6:
+						szErrMsg = "TTL expired";
+						break;
+					case 7:
+						szErrMsg = "Command not supported / protocol error";
+						break;
+					case 8:
+						szErrMsg = "Address type not supported";
 				}
 			OutputToLog(OUTPUT_ALL, "Connecting through SOCKS server has failed: %s", szErrMsg);
 			RemoveEntry(psEntry, hSock, g_bCacheEnabled);
@@ -785,83 +791,86 @@ THREAD_FUNCTION(DnsThread, pEntry)
 		}
 		//get rest of answer
 		//all bytes after that are part of the "normal" communication
-		switch(((uint8_t*)u16aBuf)[3])
+		switch (((uint8_t*)u16aBuf)[3])
 		{
-		case 1:	//IPv4
-			iLen=5;
-			break;
-		case 4:	//IPv6
-			iLen=17;
-			break;
-		default:	//name
-			iLen=2+((uint8_t*)u16aBuf)[4];	//port length plus length of name
+			case 1:	//IPv4
+				iLen = 5;
+				break;
+			case 4:	//IPv6
+				iLen = 17;
+				break;
+			default:	//name
+				iLen = 2 + ((uint8_t*)u16aBuf)[4];	//port length plus length of name
 		}
-		if(!ReceiveBytes(hSock, iLen, u16aBuf))
+		if (!ReceiveBytes(hSock, iLen, u16aBuf))
 		{
 			RemoveEntry(psEntry, hSock, g_bCacheEnabled);
 			return 0;
 		}
 	}
-	iPos=2+ntohs(*psEntry->u16aRequest);
+	iPos = 2 + ntohs(*psEntry->u16aRequest);
+
 	//send DNS request via SOCKS
-	iLen=send(hSock, (const char*)psEntry->u16aRequest, iPos, 0);
-	if(iLen!=iPos)
+	iLen = send(hSock, (const char*)psEntry->u16aRequest, iPos, 0);
+	if (iLen != iPos)
 	{
-		szErrMsg=(iLen==SOCKET_ERROR)?GetSysError(WSAGetLastError()):"Invalid amount of sent bytes";
+		szErrMsg = (iLen == SOCKET_ERROR) ? GetSysError(WSAGetLastError()) : "Invalid amount of sent bytes";
 		OutputToLog(OUTPUT_ALL, "Sending through SOCKS server has failed: %s", szErrMsg);
-		if(iLen==SOCKET_ERROR)
+		if (iLen == SOCKET_ERROR)
 			FreeSysError(szErrMsg);
 		RemoveEntry(psEntry, hSock, g_bCacheEnabled);
 		return 0;
 	}
+
 	//receive answer
-	iPos=0;
-	for(;;)
+	iPos = 0;
+	for (;;)
 	{
-		iRet=recv(hSock, (char*)u16aBuf+iPos, sizeof(u16aBuf)-iPos, 0);
-		if(iRet<=0)
+		iRet = recv(hSock, (char*)u16aBuf + iPos, sizeof(u16aBuf) - iPos, 0);
+		if (iRet <= 0)
 		{
-			szErrMsg=(iRet==SOCKET_ERROR)?GetSysError(WSAGetLastError()):"Server has closed the connection unexpectedly";
+			szErrMsg = (iRet == SOCKET_ERROR) ? GetSysError(WSAGetLastError()) : "Server has closed the connection unexpectedly";
 			OutputToLog(OUTPUT_ALL, "Broken answer from DNS server: %s", szErrMsg);
-			if(iRet==SOCKET_ERROR)
+			if (iRet == SOCKET_ERROR)
 				FreeSysError(szErrMsg);
 			RemoveEntry(psEntry, hSock, g_bCacheEnabled);
 			return 0;
 		}
-		iPos+=iRet;
+		iPos += iRet;
 		//first 2 bytes contain length (Big Endian)
-		if(iPos>=2)
+		if (iPos >= 2)
 		{
-			iLen=2+ntohs(*u16aBuf);
-			if(iPos>=iLen)
+			iLen = 2 + ntohs(*u16aBuf);
+			if (iPos >= iLen)
 				break;	//answer completely received
 		}
 		//answer too long?
-		if(iPos>=sizeof(u16aBuf))
+		if (iPos >= sizeof(u16aBuf))
 		{
 			OutputToLog(OUTPUT_ALL, "Answer from DNS server too long!");
 			RemoveEntry(psEntry, hSock, g_bCacheEnabled);
 			return 0;
 		}
 	}
+
 	//invalid answer?
-	if(iPos<=4)
+	if (iPos <= 4)
 	{
 		OutputToLog(OUTPUT_ALL, "Answer from DNS server too short!");
 		RemoveEntry(psEntry, hSock, g_bCacheEnabled);
 		return 0;
 	}
 	closesocket(hSock);
-	if(g_bCacheEnabled)
+	if (g_bCacheEnabled)
 	{
 		//store answer in cache
 		EnterCriticalSection(&g_sCritSect);
-		psEntry->u16aAnswer=(uint16_t*)malloc(iLen);
+		psEntry->u16aAnswer = (uint16_t*)malloc(iLen);
 		memcpy(psEntry->u16aAnswer, u16aBuf, iLen);
 		//copy ID
-		psEntry->u16aAnswer[1]=psEntry->u16aRequest[1];
+		psEntry->u16aAnswer[1] = psEntry->u16aRequest[1];
 		//remember current time for time to live calculations
-		psEntry->iTime=time(NULL);
+		psEntry->iTime = time(NULL);
 		//send DNS answer to original requesting client via UDP or TCP
 		SendAnswer(psEntry);
 		LeaveCriticalSection(&g_sCritSect);
@@ -869,100 +878,246 @@ THREAD_FUNCTION(DnsThread, pEntry)
 	else
 	{
 		//send DNS answer to original requesting client via UDP or TCP
-		psEntry->u16aAnswer=u16aBuf;
+		psEntry->u16aAnswer = u16aBuf;
 		SendAnswer(psEntry);
 		free(psEntry);
 	}
 	return 0;
 }
 
-static int HandleWpad(uint16_t* u16aRequest, int iLen, void* pClientAddr, socklen_t iAddrLen)
+
+static char* ExtractName(const uint16_t* u16aRequest, int iLen)
 {
-	uint8_t* pu8Pos;
-	uint8_t* pu8End;
-	unsigned char uLen;
-	struct SEntry sEntry;
+	const uint8_t* pu8Pos;
+	const uint8_t* pu8End;
+	unsigned char partLen;
+	static char buf[65535] = { 0 };
+	int bufIdx = 0;
 
-	int ret = 0;
-
-	pu8Pos = (uint8_t*)u16aRequest + 12;
-	pu8End = (uint8_t*)u16aRequest + iLen;
+	pu8Pos = (const uint8_t*)u16aRequest + 12;
+	pu8End = (const uint8_t*)u16aRequest + iLen;
 	while (pu8Pos < pu8End)
 	{
-		uLen = *pu8Pos;
-		if (!uLen)
-		{
-			if (stricmp((char*)((uint8_t*)u16aRequest + 13), "wpad") == 0)
-			{
-				OutputToLog(OUTPUT_ALL, "wpad" );
-
-				memset(&sEntry, 0, sizeof(sEntry));
-				
-				sEntry.iTime = (time_t)-1;
-				sEntry.u16aAnswer = NULL;
-				sEntry.uAddrLen = (unsigned char)iAddrLen;
-				memcpy(&sEntry.client, pClientAddr, iAddrLen);
-				
-				const char* req = (const char*)u16aRequest;
-
-				const char response[] = 
-				{
-					// header
-					req[0], req[1], //id
-					-127, -128,
-					0, 1, // q_count
-					0, 1, // ans_count
-					0, 0, // auth_count
-					0, 0, // add_count
-
-					// question 1
-					4, 'w', 'p', 'a', 'd', 0, // name
-					0, 1, // 'A'
-					0, 1, // 'IN'
-
-					// answer 1
-					-64, 12, // name ref @ offset 12
-					0, 1, // 'A'
-					0, 1, // 'IN'
-					0, 0, 0, 76, // TTL
-					0, 4, // data len
-					g_wpadAddress[0], g_wpadAddress[1], g_wpadAddress[2], g_wpadAddress[3] // ip
-				};
-
-				char fullResponse[sizeof(response) + 2] = { 0 };
-
-				*((uint16_t*)fullResponse) = htons(sizeof(response));
-				memcpy(fullResponse + 2, response, sizeof(response)); // length
-
-				sEntry.u16aAnswer = (uint16_t*)fullResponse;
-				
-				SendAnswer(&sEntry);
-
-				ret = 1;
-			}
+		partLen = *pu8Pos;
+		if (partLen == 0)
 			break;
-		}
-		if (uLen >= 0xc0)	//compression used? (reference to other name via offset)
+
+		if (partLen >= 0xc0)	//compression used? (reference to other name via offset)
 			break;		//no output in this case
-		pu8Pos += uLen + 1;
+
+		memcpy(buf + bufIdx, pu8Pos + 1, partLen);
+		bufIdx += partLen;
+		buf[bufIdx++] = '.';
+
+		pu8Pos += partLen + 1;
 	}
 
-	return ret;
+	if (bufIdx > 0)
+	{
+		buf[bufIdx - 1] = 0;
+		buf[bufIdx] = 0;
+
+		return buf;
+	}
+	return NULL;
+}
+
+static int tolower2(int c)
+{
+	return c >= 'A'&&c <= 'Z' ? (c | 0x60) : c;
+}
+
+static int MatchWildcard(const char* nstring, const char* wild)
+{
+	const char* cp = NULL;
+	const char* mp = NULL;
+
+	while ((*nstring) && (*wild != '*'))
+	{
+		if ((tolower2(*wild) != tolower2(*nstring)) && (*wild != '?'))
+			return 0;
+
+		wild++;
+		nstring++;
+	}
+
+	while (*nstring)
+	{
+		char wch = *wild;
+
+		if (wch == '*')
+		{
+			if (!*++wild)
+				return 1;
+
+			mp = wild;
+			cp = nstring + 1;
+		}
+		else if ((tolower2(wch) == tolower2(*nstring)) || (wch == '?'))
+		{
+			wild++;
+			nstring++;
+		}
+		else
+		{
+			wild = mp;
+			nstring = cp++;
+		}
+	}
+
+	while (*wild == '*')
+		wild++;
+
+	return !*wild;
+}
+
+static int HandleWpad(const char* domainName, const uint16_t* u16aRequest, void* pClientAddr, socklen_t iAddrLen)
+{
+	if (MatchWildcard(domainName, "wpad") || MatchWildcard(domainName, "wpad.*"))
+	{
+		OutputToLog(OUTPUT_ALL, domainName);
+
+		struct SEntry sEntry;
+		memset(&sEntry, 0, sizeof(sEntry));
+
+		sEntry.iTime = (time_t)-1;
+		sEntry.u16aAnswer = NULL;
+		sEntry.uAddrLen = (unsigned char)iAddrLen;
+		memcpy(&sEntry.client, pClientAddr, iAddrLen);
+
+		const char* req = (const char*)u16aRequest;
+
+		char responseHeader[] = 
+		{
+			// header
+			req[0], req[1], //id
+			-127, -128,
+			0, 1, // q_count
+			0, 1, // ans_count
+			0, 0, // auth_count
+			0, 0, // add_count
+		};
+
+		char answer_v4[] =
+		{
+			// answer 1
+			-64, 12, // name ref @ offset 12
+			0, 1, // 'A'
+			0, 1, // 'IN'
+			0, 0, 0, 76, // TTL
+			0, 4, // data len
+			0,0,0,0 // ip
+		};
+
+		char answer_v6[] =
+		{
+			// answer 1
+			-64, 12, // name ref @ offset 12
+			0, 28, // 'AAA'
+			0, 1,  // 'IN'
+			0, 0, 0, 76, // TTL
+			0, 4, // data len
+			0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0 // ip
+		};
+
+		//const char responseProto[] =
+		//{
+		//	// header
+		//	req[0], req[1], //id
+		//	-127, -128,
+		//	0, 1, // q_count
+		//	0, 1, // ans_count
+		//	0, 0, // auth_count
+		//	0, 0, // add_count
+		//
+		//	// question 1
+		//	4, 'w', 'p', 'a', 'd', 0, // name
+		//	0, 1, // 'A'
+		//	0, 1, // 'IN'
+		//
+		//	// answer 1
+		//	-64, 12, // name ref @ offset 12
+		//	  0, 1, // 'A'
+		//	  0, 1, // 'IN'
+		//	  0, 0, 0, 76, // TTL
+		//	  0, 4, // data len
+		//	g_wpadAddress[0], g_wpadAddress[1], g_wpadAddress[2], g_wpadAddress[3] // ip
+		//};
+
+		int responseSize = 0;
+		char response[65535] = { 0 };
+
+		char* responseContent = response + 2;
+		memcpy(responseContent, responseHeader, sizeof(responseHeader));
+		responseContent += sizeof(responseHeader);
+		responseSize += sizeof(responseHeader);
+
+		int questionLength = strlen((char*)u16aRequest + 12) + 1 + 4;
+		memcpy(responseContent, (char*)u16aRequest + 12, questionLength);
+		responseContent += questionLength;
+		responseSize += questionLength;
+
+		char* selectedAnswer;
+		int selectedAnswerSize;
+
+		if (g_wpadAddr.ss_family == AF_INET6)
+		{
+			selectedAnswer = answer_v6;
+			selectedAnswerSize = sizeof(answer_v6);
+
+			struct sockaddr_in6* v6Address = (struct sockaddr_in6*)&g_wpadAddr;
+			memcpy(selectedAnswer + 12, &v6Address->sin6_addr.s6_addr, 16);
+		}
+		else if (g_wpadAddr.ss_family == AF_INET)
+		{
+			selectedAnswer = answer_v4;
+			selectedAnswerSize = sizeof(answer_v4);
+
+			struct sockaddr_in* v4Address = (struct sockaddr_in*)&g_wpadAddr;
+			memcpy(selectedAnswer + 12, &v4Address->sin_addr.s_addr, 4);
+		}
+		else return 0;
+
+		memcpy(responseContent, selectedAnswer, selectedAnswerSize);
+		responseContent += selectedAnswerSize;
+		responseSize += selectedAnswerSize;
+
+		*((uint16_t*)response) = htons(responseSize); // write length
+
+		sEntry.u16aAnswer = (uint16_t*)response;
+
+		SendAnswer(&sEntry);
+
+		return 1;
+	}
+	return 0;
 }
 
 //searches the cache for the same request and sends the answer if there is a cache hit
 //or creates a thread for forwarding the request to the DNS server via SOCKS
 static void HandleDnsRequest(uint16_t* u16aRequest, int iLen, void* pClientAddr, socklen_t iAddrLen)
 {
-	if (g_useWpad && HandleWpad(u16aRequest, iLen, pClientAddr, iAddrLen))
+	const char* domainName = ExtractName(u16aRequest, iLen);
+
+	if (HandleWpad(domainName, u16aRequest, pClientAddr, iAddrLen))
 	{
 		return;
 	}
 
-	uint8_t* pu8Pos;
-	uint8_t* pu8End;
+	int isAltDomain = 0;
+	if (g_altDomainFilterCount && g_useAltProxyServer)
+	{
+		for (int i = 0; i < g_altDomainFilterCount; i++)
+		{
+			if (MatchWildcard(domainName, g_altDomainFilters[i]))
+			{
+				isAltDomain = 1;
+				break;
+			}
+		}
+	}
+
 	struct SEntry* psEntry;
-	unsigned char uLen;
 
 	//search in cache
 	EnterCriticalSection(&g_sCritSect);
@@ -971,37 +1126,26 @@ static void HandleDnsRequest(uint16_t* u16aRequest, int iLen, void* pClientAddr,
 		if(!psEntry)
 		{
 			//create new entry (length of struct SEntry up to u16aRequest plus request length plus 2 for length)
-			psEntry=(struct SEntry*)malloc(((uint8_t*)psEntry->u16aRequest-(uint8_t*)psEntry)+iLen+2);
-			psEntry->iTime=(time_t)-1;
-			psEntry->u16aAnswer=NULL;
-			psEntry->uAddrLen=(unsigned char)iAddrLen;
+			psEntry = (struct SEntry*)malloc(((uint8_t*)psEntry->u16aRequest - (uint8_t*)psEntry) + iLen + 2);
+			psEntry->iTime = (time_t)-1;
+			psEntry->isAltDomain = isAltDomain;
+			psEntry->u16aAnswer = NULL;
+			psEntry->uAddrLen = (unsigned char)iAddrLen;
 			memcpy(&psEntry->client, pClientAddr, iAddrLen);
-			*psEntry->u16aRequest=htons((uint16_t)iLen);
+			*psEntry->u16aRequest = htons((uint16_t)iLen);
 			memcpy(psEntry->u16aRequest+1, u16aRequest, iLen);
+
 			//add entry to cache list in case cache is enabled
-			psEntry->psNext=g_psFirst;
-			if(g_bCacheEnabled)
-				g_psFirst=psEntry;
+			psEntry->psNext = g_psFirst;
+			if (g_bCacheEnabled)
+				g_psFirst = psEntry;
+
 			//create thread to resolve entry
 			if(ThreadCreate(DnsThread, psEntry))
 			{
 				++g_uCacheCount;
-				//output amount of entries and current entry
-				pu8Pos=(uint8_t*)u16aRequest+12;
-				pu8End=(uint8_t*)u16aRequest+iLen;
-				while(pu8Pos<pu8End)
-				{
-					uLen=*pu8Pos;
-					if(!uLen)
-					{
-						OutputToLog(OUTPUT_ALL, "%3u %s", g_uCacheCount, (char*)((uint8_t*)u16aRequest+13));
-						break;
-					}
-					if(uLen>=0xc0)	//compression used? (reference to other name via offset)
-						break;		//no output in this case
-					*pu8Pos='.';	//replace length by .
-					pu8Pos+=uLen+1;
-				}
+
+				OutputToLog(OUTPUT_ALL, "%3u %s", g_uCacheCount, domainName);
 			}
 			else
 			{
@@ -1011,6 +1155,7 @@ static void HandleDnsRequest(uint16_t* u16aRequest, int iLen, void* pClientAddr,
 			}
 			break;
 		}
+
 		//cache hit? (do not compare ID in first 2 bytes of request)
 		if((uint16_t)iLen==ntohs(*psEntry->u16aRequest) && memcmp(u16aRequest+1, psEntry->u16aRequest+2, iLen-2)==0)
 		{
@@ -1018,16 +1163,19 @@ static void HandleDnsRequest(uint16_t* u16aRequest, int iLen, void* pClientAddr,
 			if(psEntry->u16aAnswer)
 			{
 				//answer to current address
-				psEntry->uAddrLen=(unsigned char)iAddrLen;
+				psEntry->uAddrLen = (unsigned char)iAddrLen;
 				memcpy(&psEntry->client, pClientAddr, iAddrLen);
+
 				//check if expired
 				if(!CalculateTimeToLive(psEntry))
 				{
 					//expired -> kill last answer
 					free(psEntry->u16aAnswer);
-					psEntry->u16aAnswer=NULL;
+					psEntry->u16aAnswer = NULL;
+					
 					//copy current ID
-					psEntry->u16aRequest[1]=*u16aRequest;
+					psEntry->u16aRequest[1] = *u16aRequest;
+
 					//create thread to resolve request again
 					if(!ThreadCreate(DnsThread, psEntry))
 						RemoveEntry(psEntry, (SOCKET)SOCKET_ERROR, 0);
@@ -1042,12 +1190,14 @@ static void HandleDnsRequest(uint16_t* u16aRequest, int iLen, void* pClientAddr,
 			else
 			{
 				//copy current ID so the thread uses that one if it gets the answer
-				psEntry->u16aRequest[1]=*u16aRequest;
+				psEntry->u16aRequest[1] = *u16aRequest;
+
 				//overwrite address; currently we can only handle one request address while waiting for an answer through SOCKS
 				//current address is TCP? -> need to close it before overwriting it
-				if(psEntry->uAddrLen==sizeof(SOCKET))
+				if (psEntry->uAddrLen == sizeof(SOCKET))
 					closesocket(psEntry->client.hSock);
-				psEntry->uAddrLen=(unsigned char)iAddrLen;
+
+				psEntry->uAddrLen = (unsigned char)iAddrLen;
 				memcpy(&psEntry->client, pClientAddr, iAddrLen);
 			}
 			break;
@@ -1094,59 +1244,62 @@ THREAD_FUNCTION(TcpThread, pAddr)
 	struct sockaddr_storage sAddr;
 	char* szErrMsg;
 
-	hSockServer=socket(((struct sockaddr_storage*)pAddr)->ss_family, SOCK_STREAM, IPPROTO_TCP);
-	if(hSockServer==SOCKET_ERROR)
+	hSockServer = socket(((struct sockaddr_storage*)pAddr)->ss_family, SOCK_STREAM, IPPROTO_TCP);
+	if (hSockServer == SOCKET_ERROR)
 	{
-		szErrMsg=GetSysError(WSAGetLastError());
+		szErrMsg = GetSysError(WSAGetLastError());
 		OutputToLog(OUTPUT_ALL, "Creating a TCP socket has failed: %s", szErrMsg);
 		FreeSysError(szErrMsg);
 		return 0;
 	}
+
 	//bind+listen on local TCP port (get DNS requests)
-	if(bind(hSockServer, (struct sockaddr*)pAddr, GetAddrLen((struct sockaddr_storage*)pAddr))==SOCKET_ERROR)
+	if (bind(hSockServer, (struct sockaddr*)pAddr, GetAddrLen((struct sockaddr_storage*)pAddr)) == SOCKET_ERROR)
 	{
 		OutputBindError(hSockServer, (struct sockaddr_storage*)pAddr, 0);
 		return 0;
 	}
-	if(listen(hSockServer, 5)==SOCKET_ERROR)
+
+	if (listen(hSockServer, 5) == SOCKET_ERROR)
 	{
-		szErrMsg=GetSysError(WSAGetLastError());
+		szErrMsg = GetSysError(WSAGetLastError());
 		closesocket(hSockServer);
 		OutputToLog(OUTPUT_ALL, "Listening on TCP socket has failed: %s", szErrMsg);
 		FreeSysError(szErrMsg);
 		return 0;
 	}
+
 	//as long as "accept" is working
-	for(;;)
+	for (;;)
 	{
-		iAddrLen=sizeof(sAddr);
-		hSock=accept(hSockServer, (struct sockaddr*)&sAddr, &iAddrLen);
-		if(hSock==SOCKET_ERROR)
+		iAddrLen = sizeof(sAddr);
+		hSock = accept(hSockServer, (struct sockaddr*)&sAddr, &iAddrLen);
+		if (hSock == SOCKET_ERROR)
 		{
-			szErrMsg=GetSysError(WSAGetLastError());
+			szErrMsg = GetSysError(WSAGetLastError());
 			OutputToLog(OUTPUT_ALL, "Accepting new connection on TCP socket has failed: %s", szErrMsg);
 			FreeSysError(szErrMsg);
 			break;
 		}
 		//collect the whole DNS request
-		iCurBufLen=0;
-		for(;;)
+		iCurBufLen = 0;
+		for (;;)
 		{
-			iLen=recv(hSock, (char*)u16aBuf+iCurBufLen, sizeof(u16aBuf)-iCurBufLen, 0);
-			if(iLen<=0)
+			iLen = recv(hSock, (char*)u16aBuf + iCurBufLen, sizeof(u16aBuf) - iCurBufLen, 0);
+			if (iLen <= 0)
 			{
-				szErrMsg=GetSysError(WSAGetLastError());
+				szErrMsg = GetSysError(WSAGetLastError());
 				closesocket(hSock);
 				OutputToLog(OUTPUT_ALL, "DNS request on TCP broken: %s", szErrMsg);
 				FreeSysError(szErrMsg);
 				break;
 			}
-			iCurBufLen+=iLen;
+			iCurBufLen += iLen;
 			//got the whole DNS request?
-			if(iCurBufLen>=2 && (u16ReqLen=ntohs(*u16aBuf))+2>=iCurBufLen)
+			if (iCurBufLen >= 2 && (u16ReqLen = ntohs(*u16aBuf)) + 2 >= iCurBufLen)
 			{
-				if(u16ReqLen>12)	//12 bytes header plus at least one byte of data
-					HandleDnsRequest(u16aBuf+1, u16ReqLen, &hSock, sizeof(hSock));	//HandleDnsRequest takes care of hSock now
+				if (u16ReqLen > 12)	//12 bytes header plus at least one byte of data
+					HandleDnsRequest(u16aBuf + 1, u16ReqLen, &hSock, sizeof(hSock));	//HandleDnsRequest takes care of hSock now
 				else
 					closesocket(hSock);
 				break;
@@ -1213,18 +1366,18 @@ static int ParseIpAndPort(int iFlag, const char* szParamName, const char* szPort
 			}
 		}
 		//only for the DNS server also support name
-		if(&g_sDnsSrvAddr==psAddr)
+		if(&g_dnsSrvAddr==psAddr)
 		{
 			size_t uLen=strlen(szIpAndPort);
 
 			if(uLen<256 && uLen)
 			{
-				((struct sockaddr_in6*)&g_sDnsSrvAddr)->sin6_port=htons((uint16_t)atoi(szPort));
-				if(((struct sockaddr_in6*)&g_sDnsSrvAddr)->sin6_port)
+				((struct sockaddr_in6*)&g_dnsSrvAddr)->sin6_port=htons((uint16_t)atoi(szPort));
+				if(((struct sockaddr_in6*)&g_dnsSrvAddr)->sin6_port)
 				{
-					g_sDnsSrvAddr.ss_family=AF_UNSPEC;	//this marks usage of name
-					*(char**)&((struct sockaddr_in6*)&g_sDnsSrvAddr)->sin6_addr=szIpAndPort;	//use sin6_addr for pointer to name (128 bit -> large enough, alignment should also be fine)
-					((struct sockaddr_in6*)&g_sDnsSrvAddr)->sin6_flowinfo=(uint8_t)uLen;		//use sin6_flowinfo for length
+					g_dnsSrvAddr.ss_family=AF_UNSPEC;	//this marks usage of name
+					*(char**)&((struct sockaddr_in6*)&g_dnsSrvAddr)->sin6_addr=szIpAndPort;	//use sin6_addr for pointer to name (128 bit -> large enough, alignment should also be fine)
+					((struct sockaddr_in6*)&g_dnsSrvAddr)->sin6_flowinfo=(uint8_t)uLen;		//use sin6_flowinfo for length
 					return 1;	//o.k.
 				}
 			}
@@ -1248,15 +1401,16 @@ static int ParseIpAndPort(int iFlag, const char* szParamName, const char* szPort
 static int CreateHttpProxyConnectCommand()
 {
 	memcpy(g_caHttpProxyConnect, "CONNECT ", 8);
-	g_iHttpProxyConnectLen=8;
-	if(g_sDnsSrvAddr.ss_family==AF_UNSPEC)
+	g_iHttpProxyConnectLen = 8;
+
+	if (g_dnsSrvAddr.ss_family == AF_UNSPEC)
 	{
 		//sin6_addr contains pointer to name, see ParseIpAndPort (max. length is 255)
-		int iLenDnsAddr=sprintf(g_caHttpProxyConnect+g_iHttpProxyConnectLen, "%s:%u", *(char**)&((struct sockaddr_in6*)&g_sDnsSrvAddr)->sin6_addr, ntohs(((struct sockaddr_in6*)&g_sDnsSrvAddr)->sin6_port));
+		int iLenDnsAddr = sprintf(g_caHttpProxyConnect + g_iHttpProxyConnectLen, "%s:%u", *(char**)&((struct sockaddr_in6*)&g_dnsSrvAddr)->sin6_addr, ntohs(((struct sockaddr_in6*)&g_dnsSrvAddr)->sin6_port));
 
-		if(iLenDnsAddr<=0)
+		if (iLenDnsAddr <= 0)
 			return 0;	//error
-		g_iHttpProxyConnectLen+=iLenDnsAddr;
+		g_iHttpProxyConnectLen += iLenDnsAddr;
 	}
 	else
 	{
@@ -1264,32 +1418,134 @@ static int CreateHttpProxyConnectCommand()
 		char szPort[6];
 		int iLenPort;
 
-		if(g_sDnsSrvAddr.ss_family==AF_INET6)
-			g_caHttpProxyConnect[g_iHttpProxyConnectLen++]='[';	//enclose with [] for IPv6
-		if(getnameinfo((struct sockaddr*)&g_sDnsSrvAddr, GetAddrLen(&g_sDnsSrvAddr), g_caHttpProxyConnect+g_iHttpProxyConnectLen, 128, szPort, sizeof(szPort), NI_NUMERICHOST|NI_NUMERICSERV))
+		if (g_dnsSrvAddr.ss_family == AF_INET6)
+			g_caHttpProxyConnect[g_iHttpProxyConnectLen++] = '[';	//enclose with [] for IPv6
+		if (getnameinfo((struct sockaddr*)&g_dnsSrvAddr, GetAddrLen(&g_dnsSrvAddr), g_caHttpProxyConnect + g_iHttpProxyConnectLen, 128, szPort, sizeof(szPort), NI_NUMERICHOST | NI_NUMERICSERV))
 			return 0;	//error
-		g_iHttpProxyConnectLen+=(int)strlen(g_caHttpProxyConnect+g_iHttpProxyConnectLen);
-		if(g_sDnsSrvAddr.ss_family==AF_INET6)
-			g_caHttpProxyConnect[g_iHttpProxyConnectLen++]=']';	//enclose with [] for IPv6
-		g_caHttpProxyConnect[g_iHttpProxyConnectLen++]=':';
-		iLenPort=(int)strlen(szPort);
-		memcpy(g_caHttpProxyConnect+g_iHttpProxyConnectLen, szPort, iLenPort);
-		g_iHttpProxyConnectLen+=iLenPort;
+		g_iHttpProxyConnectLen += (int)strlen(g_caHttpProxyConnect + g_iHttpProxyConnectLen);
+		if (g_dnsSrvAddr.ss_family == AF_INET6)
+			g_caHttpProxyConnect[g_iHttpProxyConnectLen++] = ']';	//enclose with [] for IPv6
+		g_caHttpProxyConnect[g_iHttpProxyConnectLen++] = ':';
+		iLenPort = (int)strlen(szPort);
+		memcpy(g_caHttpProxyConnect + g_iHttpProxyConnectLen, szPort, iLenPort);
+		g_iHttpProxyConnectLen += iLenPort;
 	}
+
 	//complete command
-	memcpy(g_caHttpProxyConnect+g_iHttpProxyConnectLen, " HTTP/1.0\r\n\r\n", 13);
-	g_iHttpProxyConnectLen+=13;
+	memcpy(g_caHttpProxyConnect + g_iHttpProxyConnectLen, " HTTP/1.0\r\n\r\n", 13);
+	g_iHttpProxyConnectLen += 13;
 	return 1;	//o.k.
+}
+
+static int isblank2(int c)
+{
+	return c == ' ' || c == '\t' || c == '\r' || c == '\n';
+}
+
+static void LoadAltDomainFilters(const char* path)
+{
+	FILE* file = fopen(path, "r");
+	if (file)
+	{
+		fseek(file, 0, SEEK_END);
+		int fileSize = ftell(file);
+		fseek(file, 0, SEEK_SET);
+
+		static const char utf8BOM[] = { 0xEF, 0xBB, 0xBF };
+
+		char* content = (char*)malloc(fileSize + 1);
+		memset(content, 0, fileSize + 1);
+		fread(content, 1, fileSize, file);
+
+		char* contentEnd = content + fileSize;
+
+		if (fileSize > 3 && memcmp(utf8BOM, content, sizeof(utf8BOM) == 0))
+		{
+			content += 3;
+		}
+
+		char* chPos = content;
+
+		while (isblank2(*chPos))
+			chPos++;
+
+		if (chPos < contentEnd)
+		{
+			g_altDomainFilters[g_altDomainFilterCount++] = chPos;
+		}
+
+		while (chPos < contentEnd - 1)
+		{
+			char curCh = *chPos;
+			char nextCh = *(chPos + 1);
+
+			int blank = isblank2(curCh);
+
+			if (blank && !isblank2(nextCh))
+			{
+				g_altDomainFilters[g_altDomainFilterCount++] = chPos + 1;
+			}
+
+			if (blank)
+				*chPos = 0;
+			
+			chPos++;
+		}
+
+		fclose(file);
+	}
+}
+
+static void StoreAddressName(struct sockaddr_storage* addr, uint16_t** u16aBuf, const char** name , int withPort )
+{
+	char nameBuf[256];
+	char portBuf[64];
+
+	if (g_dnsSrvAddr.ss_family == AF_UNSPEC)	//name for DNS server?
+	{
+		//sin6_addr contains pointer to name, see ParseIpAndPort (max. length is 255)
+		strcpy(nameBuf, *(char**)&((struct sockaddr_in6*)&g_dnsSrvAddr)->sin6_addr);
+		sprintf(portBuf, "%hu", ntohs(((struct sockaddr_in6*)&g_dnsSrvAddr)->sin6_port));
+
+		if (withPort)
+		{
+			sprintf((char*)*u16aBuf, "%s:%s", nameBuf, portBuf);
+		}
+		else
+		{
+			strcpy((char*)*u16aBuf, nameBuf);
+		}
+		*name = (char*)*u16aBuf;
+
+		*u16aBuf += 160;
+	}
+	else
+	{
+		if (getnameinfo((struct sockaddr*)addr, GetAddrLen(addr), nameBuf, 256, portBuf, 16, NI_NUMERICHOST | NI_NUMERICSERV))
+		{
+			*name = "unknown address";
+		}
+		else
+		{
+			if (withPort)
+				sprintf((char*)*u16aBuf, "%s:%s", nameBuf, portBuf);
+			else
+				strcpy((char*)*u16aBuf, nameBuf);
+
+			*name = (char*)*u16aBuf;
+
+			*u16aBuf += 160;
+		}
+	}
 }
 
 int main(int iArgCount, char** szaArgs)
 {
-	static struct sockaddr_storage sAddr;	//make it static so the lower array assignment causes no compiler warning
+	static struct sockaddr_storage bindAddr;	//make it static so the lower array assignment causes no compiler warning
 	const char* szUser;
 	const char* szPassword;
 	char** pszCurArg;
 	char* szCurArg;
-	char* szLogFilePath;
 	char* szErrMsg;
 	size_t uUserLen;
 	size_t uPasswordLen;
@@ -1299,6 +1555,7 @@ int main(int iArgCount, char** szaArgs)
 	int bAppend;	//append log file?
 	int bQuiet;		//parameter q specified?
 	uint16_t u16aBuf[32754];	//max UDP packet length on Windows plus one byte - using uint16_t here for alignment
+
 	//struct array for the three addresses passed via command line
 	struct SAddr
 	{
@@ -1307,116 +1564,114 @@ int main(int iArgCount, char** szaArgs)
 		const char* szDefaultPort;
 		const char* szName;
 		int iFlag;
-	} saAddresses[3]=
+	} saAddresses[] =
 	{
-		{ &g_sSocksAddr, DEFAULT_SOCKS_SERVER, DEFAULT_SOCKS_PORT, "SOCKS server", 0 },
-		{ &g_sDnsSrvAddr, DEFAULT_DNS_SERVER, DEFAULT_DNS_PORT, "DNS server", 0 },
-		{ &sAddr, DEFAULT_LISTEN_IP, DEFAULT_DNS_PORT, "listening", AI_PASSIVE }	//AI_PASSIVE for "getaddrinfo" as we use it for "bind"
+		{ &g_proxyAddr, DEFAULT_SOCKS_SERVER, DEFAULT_SOCKS_PORT, "SOCKS server", 0 },
+		{ &g_dnsSrvAddr, DEFAULT_DNS_SERVER, DEFAULT_DNS_PORT, "DNS server", 0 },
+		{ &bindAddr, DEFAULT_LISTEN_IP, DEFAULT_DNS_PORT, "listening", AI_PASSIVE }	//AI_PASSIVE for "getaddrinfo" as we use it for "bind"
 	};
-	
-	const char* wpadAddress;
-
 
 	//parse command line - use e.g. "/?" to display the usage
-	bQuiet=0;
-	bAppend=0;
-	iAddrCount=0;
-	szLogFilePath=NULL;
-	szUser=NULL;
-	szPassword=NULL;
-	wpadAddress = NULL;
+	bQuiet = 0;
+	bAppend = 0;
+	iAddrCount = 0;
+	szUser = NULL;
+	szPassword = NULL;
 
-	for(pszCurArg=szaArgs+1; --iArgCount; ++pszCurArg)
+	char* szLogFilePath = NULL;
+	char* altDomainFilterFilePath = NULL;
+
+	for (pszCurArg = szaArgs + 1; --iArgCount; ++pszCurArg)
 	{
-		szCurArg=*pszCurArg;
+		szCurArg = *pszCurArg;
+
 		//no address parameter?
-		if(*szCurArg=='-' || *szCurArg=='/')
+		if (*szCurArg == '-' || *szCurArg == '/')
 		{
-			switch(szCurArg[1])
+			switch (szCurArg[1])
 			{
-			case 'd':	//disable cache?
-			case 'D':
-				if(!szCurArg[2])
-				{
-					g_bCacheEnabled=0;
-					continue;	//correct parameter, go to next one
-				}
-				break;
-			case 'q':	//no console output?
-			case 'Q':
-				if(!szCurArg[2])
-				{
-					bQuiet=1;
-					continue;	//correct parameter, go to next one
-				}
-				break;
-			case 'l':	//log output?
-			case 'L':
-				if(!szLogFilePath)	//only allowed once
-				{
-					bAppend=(szCurArg[2]=='a' || szCurArg[2]=='A');	//append?
-					if(szCurArg[2+bAppend]==':')
+				case 'd':	//disable cache?
+				case 'D':
+					if (!szCurArg[2])
 					{
-						szLogFilePath=szCurArg+3+bAppend;
+						g_bCacheEnabled = 0;
 						continue;	//correct parameter, go to next one
 					}
-				}
-				break;
-			case 'u':	//user?
-			case 'U':
-				if(!szUser && szCurArg[2]==':')	//only allowed once and : must be 2nd char
-				{
-					szUser=szCurArg+3;
-					continue;
-				}
-				break;
-			case 'p':	//password?
-			case 'P':
-				if(!szPassword && szCurArg[2]==':')	//only allowed once and : must be 2nd char
-				{
-					szPassword=szCurArg+3;
-					continue;
-				}
-				break;
-			case 't':	//HTTP proxy?
-			case 'T':
-				g_iHttpProxyConnectLen=1;	//used as boolean here; later it contains the real length of the CONNECT command
-				continue;
-			case 'w':
-			case 'W':
-				if (!wpadAddress && szCurArg[2] == ':')
-				{
-					wpadAddress = szCurArg + 3;
-
-					const char* p = wpadAddress;
-					int pos = 0;
-					while (pos < 4)
+					break;
+				case 'q':	//no console output?
+				case 'Q':
+					if (!szCurArg[2])
 					{
-						g_wpadAddress[pos++] = (char)atoi(p);
-
-						while (*p && *p != '.')
-							p++;
-						p++;
-
-						if (*p == 0)
-							break;
+						bQuiet = 1;
+						continue;	//correct parameter, go to next one
 					}
-
-					if (pos == 4)
+					break;
+				case 'l':	//log output?
+				case 'L':
+					if (!szLogFilePath)	//only allowed once
 					{
+						bAppend = (szCurArg[2] == 'a' || szCurArg[2] == 'A');	//append?
+						if (szCurArg[2 + bAppend] == ':')
+						{
+							szLogFilePath = szCurArg + 3 + bAppend;
+							continue;	//correct parameter, go to next one
+						}
+					}
+					break;
+				case 'u':	//user?
+				case 'U':
+					if (!szUser && szCurArg[2] == ':')	//only allowed once and : must be 2nd char
+					{
+						szUser = szCurArg + 3;
+						continue;
+					}
+					break;
+				case 'p':	//password?
+				case 'P':
+					if (!szPassword && szCurArg[2] == ':')	//only allowed once and : must be 2nd char
+					{
+						szPassword = szCurArg + 3;
+						continue;
+					}
+					break;
+				case 't':	//HTTP proxy?
+				case 'T':
+					g_iHttpProxyConnectLen = 1;	//used as boolean here; later it contains the real length of the CONNECT command
+					continue;
+				case 'w':
+				case 'W':
+					if (szCurArg[2] == ':')
+					{
+						ParseIpAndPort(0, "Wpad address", "0", szCurArg + 3, &g_wpadAddr);
 						g_useWpad = 1;
 						continue;
 					}
-				}
-				break;
+					break;
+				case 'a':
+				case 'A':
+					if (szCurArg[2] == ':')
+					{
+						ParseIpAndPort(0, "Alt proxy server", "0", szCurArg + 3, &g_altProxyAddr);
+						g_useAltProxyServer = 1;
+						continue;
+					}
+					break;
+				case 'f':
+				case 'F':
+					if (!altDomainFilterFilePath && szCurArg[2] == ':')
+					{
+						altDomainFilterFilePath = szCurArg + 3;
+						continue;
+					}
+					break;
 			}
 		}
 		else
 		{
 			//try to parse address
-			if(iAddrCount<sizeof(saAddresses)/sizeof(*saAddresses))
+			if (iAddrCount < sizeof(saAddresses) / sizeof(*saAddresses))
 			{
-				if(!ParseIpAndPort(saAddresses[iAddrCount].iFlag, saAddresses[iAddrCount].szName, saAddresses[iAddrCount].szDefaultPort, szCurArg, saAddresses[iAddrCount].psAddr))
+				if (!ParseIpAndPort(saAddresses[iAddrCount].iFlag, saAddresses[iAddrCount].szName, saAddresses[iAddrCount].szDefaultPort, szCurArg, saAddresses[iAddrCount].psAddr))
 					return 1;
 				++iAddrCount;
 				continue;	//correct parameter, go to next one
@@ -1446,31 +1701,31 @@ int main(int iArgCount, char** szaArgs)
 			DEFAULT_LISTEN_IP, DEFAULT_DNS_PORT);
 		return 1;
 	}
-	if(szPassword && !szUser)
+	if (szPassword && !szUser)
 	{
 		OutputFatal("\nPassword specified but no user!\n");
 		return 1;
 	}
-	if(!szPassword && szUser)
+	if (!szPassword && szUser)
 	{
 		OutputFatal("\nUser specified but no password!\n");
 		return 1;
 	}
-	if(g_iHttpProxyConnectLen && szPassword)
+	if (g_iHttpProxyConnectLen && szPassword)
 	{
 		OutputFatal("\nAuthentication not supported for HTTP proxy!\n");
 		return 1;
 	}
-	if(szUser)
+	if (szUser)
 	{
-		uUserLen=strlen(szUser);
-		if(uUserLen>255)
+		uUserLen = strlen(szUser);
+		if (uUserLen > 255)
 		{
 			OutputFatal("\nUser exceeds 255 characters!\n");
 			return 1;
 		}
-		uPasswordLen=strlen(szPassword);
-		if(uPasswordLen>255)
+		uPasswordLen = strlen(szPassword);
+		if (uPasswordLen > 255)
 		{
 			OutputFatal("\nPassword exceeds 255 characters!\n");
 			return 1;
@@ -1479,112 +1734,123 @@ int main(int iArgCount, char** szaArgs)
 	else
 	{
 		//initialize uUserLen and uPasswordLen - otherwise VC++ 2010 outputs a wrong warning
-		uUserLen=0;
-		uPasswordLen=0;
+		uUserLen = 0;
+		uPasswordLen = 0;
 	}
 
 	//fill unspecified addresses with default values
-	while(iAddrCount<sizeof(saAddresses)/sizeof(*saAddresses))
+	while (iAddrCount < sizeof(saAddresses) / sizeof(*saAddresses))
 	{
-		if(!ParseIpAndPort(saAddresses[iAddrCount].iFlag, saAddresses[iAddrCount].szName, saAddresses[iAddrCount].szDefaultPort, (char*)saAddresses[iAddrCount].szDefaultAddress, saAddresses[iAddrCount].psAddr))
+		if (!ParseIpAndPort(saAddresses[iAddrCount].iFlag, saAddresses[iAddrCount].szName, saAddresses[iAddrCount].szDefaultPort, (char*)saAddresses[iAddrCount].szDefaultAddress, saAddresses[iAddrCount].psAddr))
 			return 1;
 		++iAddrCount;
 	}
 
 	//create CONNECT command in case of using HTPP proxy
-	if(g_iHttpProxyConnectLen)
+	if (g_iHttpProxyConnectLen)
 	{
-		if(!CreateHttpProxyConnectCommand())
+		if (!CreateHttpProxyConnectCommand())
 		{
 			OutputFatal("\nFailed to create CONNECT command!\n");
 			return 1;
 		}
 	}
 
-	g_hSockUdp=socket(sAddr.ss_family, SOCK_DGRAM, IPPROTO_UDP);
-	if(g_hSockUdp==SOCKET_ERROR)
+	g_hSockUdp = socket(bindAddr.ss_family, SOCK_DGRAM, IPPROTO_UDP);
+	if (g_hSockUdp == SOCKET_ERROR)
 	{
-		szErrMsg=GetSysError(WSAGetLastError());
+		szErrMsg = GetSysError(WSAGetLastError());
 		OutputFatal("\nCreating a UDP socket has failed: %s\n", szErrMsg);
 		FreeSysError(szErrMsg);
 		return 1;
 	}
+
 	//listen on local UDP port (get DNS requests)
-	if(bind(g_hSockUdp, (struct sockaddr*)&sAddr, GetAddrLen(&sAddr))==SOCKET_ERROR)
+	if (bind(g_hSockUdp, (struct sockaddr*)&bindAddr, GetAddrLen(&bindAddr)) == SOCKET_ERROR)
 	{
-		OutputBindError(g_hSockUdp, &sAddr, 1);
+		OutputBindError(g_hSockUdp, &bindAddr, 1);
 		return 1;
 	}
-	if(!bQuiet)
+
+	if (!bQuiet)
 		OpenConsole();
-	//convert adresses+ports to strings
-	if(getnameinfo((struct sockaddr*)&g_sSocksAddr, GetAddrLen(&g_sSocksAddr), (char*)u16aBuf, 256, (char*)u16aBuf+256, 256, NI_NUMERICHOST|NI_NUMERICSERV))
+
+	if (!!g_useAltProxyServer != !!altDomainFilterFilePath)
 	{
-		//should never happen
-		strcpy((char*)u16aBuf, "unknown address");
-		strcpy((char*)u16aBuf+256, "unknown");
+		OutputToLog(OUTPUT_LINE_BREAK | OUTPUT_CONSOLE, "Warning: Alt proxy server and alt domain filter must be both specified(if using) or unspecified(if not using).");
 	}
-	if(g_sDnsSrvAddr.ss_family==AF_UNSPEC)	//name for DNS server?
+
+	if (altDomainFilterFilePath)
 	{
-		//sin6_addr contains pointer to name, see ParseIpAndPort (max. length is 255)
-		strcpy((char*)u16aBuf+512, *(char**)&((struct sockaddr_in6*)&g_sDnsSrvAddr)->sin6_addr);
-		sprintf((char*)u16aBuf+768, "%hu", ntohs(((struct sockaddr_in6*)&g_sDnsSrvAddr)->sin6_port));
+		LoadAltDomainFilters(altDomainFilterFilePath);
 	}
-	else if(getnameinfo((struct sockaddr*)&g_sDnsSrvAddr, GetAddrLen(&g_sDnsSrvAddr), (char*)u16aBuf+512, 256, (char*)u16aBuf+768, 256, NI_NUMERICHOST|NI_NUMERICSERV))
+
+	//convert addresses & ports to strings
+	const char* socksAddressName;
+	const char* socksAltAddressName = "";
+	const char* dnsServerAddressName;
+	const char* bindAddressName;
+	const char* wpadAddressName;
+
+	uint16_t* tempBuf = u16aBuf;
+	StoreAddressName(&g_proxyAddr, &tempBuf, &socksAddressName, 1);
+	StoreAddressName(&g_dnsSrvAddr, &tempBuf, &dnsServerAddressName, 1);
+	StoreAddressName(&bindAddr, &tempBuf, &bindAddressName, 1);
+
+	if (g_useWpad)
 	{
-		//should never happen
-		strcpy((char*)u16aBuf+512, "unknown address");
-		strcpy((char*)u16aBuf+768, "unknown");
+		StoreAddressName(&bindAddr, &tempBuf, &wpadAddressName, 0);
 	}
-	if(getnameinfo((struct sockaddr*)&sAddr, GetAddrLen(&sAddr), (char*)u16aBuf+1024, 256, (char*)u16aBuf+1280, 256, NI_NUMERICHOST|NI_NUMERICSERV))
+	
+	if (g_useAltProxyServer)
 	{
-		//should never happen
-		strcpy((char*)u16aBuf+1024, "unknown address");
-		strcpy((char*)u16aBuf+1280, "unknown");
+		StoreAddressName(&g_altProxyAddr, &tempBuf, &socksAltAddressName, 1);
 	}
+
 	//output configuration
-	OutputToLog(OUTPUT_LINE_BREAK|OUTPUT_CONSOLE, "%s %s port %s\n"
-		"DNS server   %s port %s\n"
-		"listening on %s port %s\n"
-		"cache %s\n"
-		"authentication %s\n"
-		"wpad %s\n",
-		g_iHttpProxyConnectLen?"HTTP proxy  ":"SOCKS server", (char*)u16aBuf, (char*)u16aBuf+256,
-		(char*)u16aBuf+512, (char*)u16aBuf+768,
-		(char*)u16aBuf+1024, (char*)u16aBuf+1280,
-		g_bCacheEnabled?"enabled":"disabled",
-		szUser?"enabled":"disabled", 
-		wpadAddress ? wpadAddress : "[none]");
+	OutputToLog(OUTPUT_LINE_BREAK | OUTPUT_CONSOLE, 
+		"%s\t %s, %s\n"
+		"DNS server\t %s\n"
+		"listening on\t %s\n"
+		"cache\t\t %s\n"
+		"authentication\t %s\n"
+		"wpad\t\t %s\n",
+		g_iHttpProxyConnectLen ? "HTTP proxy  " : "SOCKS server", socksAddressName, socksAltAddressName,
+		dnsServerAddressName,
+		bindAddressName,
+		g_bCacheEnabled ? "enabled" : "disabled",
+		szUser ? "enabled" : "disabled",
+		g_useWpad ? wpadAddressName : "[none]");
 
 	InitializeCriticalSection(&g_sCritSect);
 
 	//log file was requested?
-	if(szLogFilePath)
+	if (szLogFilePath)
 		OpenLogFile(szLogFilePath, bAppend);
 
 	//create authentication package if user/password was specified
-	if(szUser)
+	if (szUser)
 	{
-		g_iUsrPwdLen=uUserLen+uPasswordLen+3;
-		g_uaUsrPwd=(unsigned char*)malloc(g_iUsrPwdLen);
-		g_uaUsrPwd[0]=1;	//version 1
-		g_uaUsrPwd[1]=(unsigned char)uUserLen;
-		memcpy(g_uaUsrPwd+2, szUser, uUserLen);
-		g_uaUsrPwd[uUserLen+2]=(unsigned char)uPasswordLen;
-		memcpy(g_uaUsrPwd+uUserLen+3, szPassword, uPasswordLen);
+		g_iUsrPwdLen = uUserLen + uPasswordLen + 3;
+		g_uaUsrPwd = (unsigned char*)malloc(g_iUsrPwdLen);
+		g_uaUsrPwd[0] = 1;	//version 1
+		g_uaUsrPwd[1] = (unsigned char)uUserLen;
+		memcpy(g_uaUsrPwd + 2, szUser, uUserLen);
+		g_uaUsrPwd[uUserLen + 2] = (unsigned char)uPasswordLen;
+		memcpy(g_uaUsrPwd + uUserLen + 3, szPassword, uPasswordLen);
 	}
 	
 	//create thread for TCP connection
-	ThreadCreate(TcpThread, &sAddr);
+	ThreadCreate(TcpThread, &bindAddr);
 
 	//endless loop
 	for(;;)
 	{
 		//receive DNS request
-		iAddrLen=sizeof(sAddr);
-		iLen=recvfrom(g_hSockUdp, (char*)u16aBuf, sizeof(u16aBuf), 0, (struct sockaddr*)&sAddr, &iAddrLen);
-		if(iLen>12)	//12 bytes header plus at least one byte of data
-			HandleDnsRequest(u16aBuf, iLen, &sAddr, iAddrLen);
+		iAddrLen = sizeof(bindAddr);
+		iLen = recvfrom(g_hSockUdp, (char*)u16aBuf, sizeof(u16aBuf), 0, (struct sockaddr*)&bindAddr, &iAddrLen);
+		if (iLen > 12)	//12 bytes header plus at least one byte of data
+			HandleDnsRequest(u16aBuf, iLen, &bindAddr, iAddrLen);
 	}
 	/*no cleanup code as we have an endless loop
 	  we would need something like this:
